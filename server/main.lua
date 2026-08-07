@@ -3,6 +3,15 @@ Inventories = {}
 Drops = {}
 RegisteredShops = {}
 
+local function copyTable(value)
+    if type(value) ~= 'table' then return value end
+    local copy = {}
+    for key, entry in pairs(value) do
+        copy[copyTable(key)] = copyTable(entry)
+    end
+    return copy
+end
+
 CreateThread(function()
     MySQL.query('SELECT * FROM inventories', {}, function(result)
         if result and #result > 0 then
@@ -291,19 +300,48 @@ end)
 QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(source, cb, item)
     local src = source
     local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then
+    if not Player or type(item) ~= 'table' then
         cb(false)
         return
     end
+
+    local fromSlot = tonumber(item.fromSlot)
+    local amount = tonumber(item.amount)
+    if not fromSlot or fromSlot % 1 ~= 0 or fromSlot < 1 or fromSlot > Config.MaxSlots or not amount or amount % 1 ~= 0 or amount <= 0 then
+        cb(false)
+        return
+    end
+
+    local sourceItem = GetItemBySlot(src, fromSlot)
+    if not sourceItem or amount > sourceItem.amount then
+        cb(false)
+        return
+    end
+
+    local sourceSnapshot = copyTable(sourceItem)
+    local dropItem = copyTable(sourceItem)
+    dropItem.amount = amount
+    dropItem.slot = 1
+
     local playerPed = GetPlayerPed(src)
     local playerCoords = GetEntityCoords(playerPed)
-    if RemoveItem(src, item.name, item.amount, item.fromSlot, 'dropped item') then
-        if item.type == 'weapon' then checkWeapon(src, item) end
-        TaskPlayAnim(playerPed, 'pickup_object', 'pickup_low', 8.0, -8.0, 2000, 0, 0, false, false, false)
-        local bag = CreateObjectNoOffset(Config.ItemDropObject, playerCoords.x + 0.5, playerCoords.y + 0.5, playerCoords.z, true, true, false)
-        local dropId = NetworkGetNetworkIdFromEntity(bag)
-        local newDropId = 'drop-' .. dropId
-        local itemsTable = setmetatable({ item }, {
+    if not RemoveItem(src, sourceSnapshot.name, amount, fromSlot, 'dropped item') then
+        cb(false)
+        return
+    end
+
+    local bag
+    local dropKey
+    local createdNewDrop = false
+    local insertedSlot
+    local created, dropId = pcall(function()
+        bag = CreateObjectNoOffset(Config.ItemDropObject, playerCoords.x + 0.5, playerCoords.y + 0.5, playerCoords.z, true, true, false)
+        if not bag or bag == 0 or not DoesEntityExist(bag) then return nil end
+        local networkId = NetworkGetNetworkIdFromEntity(bag)
+        if not networkId or networkId == 0 then return nil end
+        local newDropId = 'drop-' .. networkId
+        dropKey = newDropId
+        local itemsTable = setmetatable({ dropItem }, {
             __len = function(t)
                 local length = 0
                 for _ in pairs(t) do length += 1 end
@@ -311,34 +349,57 @@ QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(sourc
             end
         })
         if not Drops[newDropId] then
+            createdNewDrop = true
             Drops[newDropId] = {
                 name = newDropId,
                 label = 'Drop',
                 items = itemsTable,
-                entityId = dropId,
+                entityId = networkId,
                 createdTime = os.time(),
                 coords = playerCoords,
                 maxweight = Config.DropSize.maxweight,
                 slots = Config.DropSize.slots,
                 isOpen = true
             }
-            TriggerClientEvent('qb-inventory:client:setupDropTarget', -1, dropId)
         else
-            table.insert(Drops[newDropId].items, item)
+            dropItem.slot = #Drops[newDropId].items + 1
+            insertedSlot = dropItem.slot
+            table.insert(Drops[newDropId].items, dropItem)
         end
-        cb(dropId)
-    else
+        return networkId
+    end)
+
+    if not created or not dropId then
+        if createdNewDrop and dropKey then
+            Drops[dropKey] = nil
+        elseif dropKey and insertedSlot and Drops[dropKey] then
+            table.remove(Drops[dropKey].items, insertedSlot)
+        end
+        Player.PlayerData.items[fromSlot] = sourceSnapshot
+        local restored = pcall(function() Player.SetPlayerData('items', Player.PlayerData.items) end)
+        if bag and DoesEntityExist(bag) then DeleteEntity(bag) end
+        if restored then
+            print(('createDrop: Drop creation failed; restored %s x%d to player %s slot %d'):format(sourceSnapshot.name, sourceSnapshot.amount, src, fromSlot))
+        else
+            print(('createDrop: CRITICAL rollback sync failed for player %s slot %d; in-memory slot was restored'):format(src, fromSlot))
+        end
         cb(false)
+        return
     end
+
+    if sourceSnapshot.type == 'weapon' then checkWeapon(src, sourceSnapshot) end
+    TaskPlayAnim(playerPed, 'pickup_object', 'pickup_low', 8.0, -8.0, 2000, 0, 0, false, false, false)
+    TriggerClientEvent('qb-inventory:client:setupDropTarget', -1, dropId)
+    cb(dropId)
 end)
 
 QBCore.Functions.CreateCallback('qb-inventory:server:attemptPurchase', function(source, cb, data)
-    local itemInfo = data.item
-    local amount = data.amount
+    if type(data) ~= 'table' or type(data.shop) ~= 'string' then cb(false) return end
+    local amount = tonumber(data.amount)
+    local requestedSlot = tonumber(data.slot or (type(data.item) == 'table' and data.item.slot))
+    if not amount or amount % 1 ~= 0 or amount <= 0 or not requestedSlot or requestedSlot % 1 ~= 0 then cb(false) return end
     local shop = string.gsub(data.shop, 'shop%-', '')
     local Player = QBCore.Functions.GetPlayer(source)
-
-    if amount < 0 then cb(false) return end
 
     if not Player then
         cb(false)
@@ -351,6 +412,9 @@ QBCore.Functions.CreateCallback('qb-inventory:server:attemptPurchase', function(
         return
     end
 
+    local shopItem = shopInfo.items[requestedSlot]
+    if not shopItem then cb(false) return end
+
     local playerPed = GetPlayerPed(source)
     local playerCoords = GetEntityCoords(playerPed)
     if shopInfo.coords then
@@ -361,29 +425,28 @@ QBCore.Functions.CreateCallback('qb-inventory:server:attemptPurchase', function(
         end
     end
 
-    if shopInfo.items[itemInfo.slot].name ~= itemInfo.name then -- Check if item name passed is the same as the item in that slot
-        cb(false)
-        return
-    end
-
-    if amount > shopInfo.items[itemInfo.slot].amount or shopInfo.items[itemInfo.slot].amount <= 0 then
+    if amount > shopItem.amount or shopItem.amount <= 0 then
         TriggerClientEvent('QBCore:Notify', source, Lang:t('notify.notenoughstock'), 'error')
         cb(false)
         return
     end
 
-    if not CanAddItem(source, itemInfo.name, amount) then
+    if not CanAddItem(source, shopItem.name, amount, shopItem.info) then
         TriggerClientEvent('QBCore:Notify', source, Lang:t('notify.canthold'), 'error')
         cb(false)
         return
     end
 
-    local price = shopInfo.items[itemInfo.slot].price * amount
+    local price = shopItem.price * amount
     if Player.PlayerData.money.cash >= price then
         Player.Functions.RemoveMoney('cash', price, 'shop-purchase')
-        AddItem(source, itemInfo.name, amount, nil, itemInfo.info, 'shop-purchase')
-        shopInfo.items[itemInfo.slot].amount -= amount
-        TriggerEvent('qb-shops:server:UpdateShopItems', shop, itemInfo, amount)
+        if not AddItem(source, shopItem.name, amount, nil, shopItem.info, 'shop-purchase') then
+            Player.Functions.AddMoney('cash', price, 'shop-purchase-refund')
+            cb(false)
+            return
+        end
+        shopItem.amount -= amount
+        TriggerEvent('qb-shops:server:UpdateShopItems', shop, shopItem, amount)
         cb(true)
     else
         TriggerClientEvent('QBCore:Notify', source, Lang:t('notify.notencash'), 'error')
@@ -425,26 +488,41 @@ QBCore.Functions.CreateCallback('qb-inventory:server:giveItem', function(source,
         return
     end
 
-    local itemAmount = GetItemByName(source, item).amount
-    if itemAmount <= 0 then
+    slot = tonumber(slot)
+    local sourceItem = slot and GetItemBySlot(source, slot)
+    if not sourceItem or sourceItem.name:lower() ~= item:lower() then
         cb(false)
         return
     end
 
     local giveAmount = tonumber(amount)
-    if giveAmount > itemAmount then
+    if not giveAmount or giveAmount <= 0 or giveAmount % 1 ~= 0 or giveAmount > sourceItem.amount then
         cb(false)
         return
     end
 
-    local removeItem = RemoveItem(source, item, giveAmount, slot, 'Item given to ID #' .. target)
+    if not CanAddItem(target, sourceItem.name, giveAmount, sourceItem.info) then
+        cb(false)
+        return
+    end
+
+    local sourceSnapshot = copyTable(sourceItem)
+
+    local removeItem = RemoveItem(source, sourceItem.name, giveAmount, slot, 'Item given to ID #' .. target)
     if not removeItem then
         cb(false)
         return
     end
 
-    local giveItem = AddItem(target, item, giveAmount, false, info, 'Item given from ID #' .. source)
+    local giveItem = AddItem(target, sourceItem.name, giveAmount, false, sourceItem.info, 'Item given from ID #' .. source)
     if not giveItem then
+        player.PlayerData.items[slot] = sourceSnapshot
+        local restored = pcall(function() player.SetPlayerData('items', player.PlayerData.items) end)
+        if restored then
+            print(('giveItem: Target add failed; restored %s x%d to player %s slot %d'):format(sourceSnapshot.name, sourceSnapshot.amount, source, slot))
+        else
+            print(('giveItem: CRITICAL rollback sync failed for player %s slot %d; in-memory slot was restored'):format(source, slot))
+        end
         cb(false)
         return
     end
@@ -501,45 +579,113 @@ local function getIdentifier(inventoryId, src)
     end
 end
 
+local function getInventoryLimits(inventoryId, src)
+    if inventoryId == 'player' then
+        local player = QBCore.Functions.GetPlayer(src)
+        return player and player.PlayerData.items, Config.MaxWeight, Config.MaxSlots
+    elseif inventoryId:find('otherplayer-') == 1 then
+        local targetId = tonumber(inventoryId:match('otherplayer%-(.+)'))
+        local player = targetId and QBCore.Functions.GetPlayer(targetId)
+        return player and player.PlayerData.items, Config.MaxWeight, Config.MaxSlots
+    elseif inventoryId:find('drop-') == 1 then
+        local inventory = Drops[inventoryId]
+        return inventory and inventory.items, inventory and inventory.maxweight, inventory and inventory.slots
+    end
+    local inventory = Inventories[inventoryId]
+    return inventory and inventory.items, inventory and inventory.maxweight, inventory and inventory.slots
+end
+
+local function syncPlayerInventory(inventoryId, src, items)
+    local playerId
+    if inventoryId == 'player' then
+        playerId = src
+    elseif inventoryId:find('otherplayer-') == 1 then
+        playerId = tonumber(inventoryId:match('otherplayer%-(.+)'))
+    end
+    if not playerId then return true end
+    local player = QBCore.Functions.GetPlayer(playerId)
+    if not player then return false end
+    return pcall(function() player.SetPlayerData('items', items) end)
+end
+
+local function restoreMoveState(fromInventory, toInventory, src, fromItems, toItems, fromSlot, toSlot, fromSnapshot, toSnapshot, reason)
+    fromItems[fromSlot] = copyTable(fromSnapshot)
+    toItems[toSlot] = copyTable(toSnapshot)
+    local sourceSynced = syncPlayerInventory(fromInventory, src, fromItems)
+    local destinationSynced = toItems == fromItems or syncPlayerInventory(toInventory, src, toItems)
+    if sourceSynced and destinationSynced then
+        print(('SetInventoryData: %s failed; authoritative source and destination slots restored'):format(reason))
+    else
+        print(('SetInventoryData: CRITICAL %s rollback sync failed; in-memory slots were restored'):format(reason))
+    end
+end
+
 RegisterNetEvent('qb-inventory:server:SetInventoryData', function(fromInventory, toInventory, fromSlot, toSlot, fromAmount, toAmount)
+    if type(fromInventory) ~= 'string' or type(toInventory) ~= 'string' then return end
     if toInventory:find('shop%-') then return end
-    if not fromInventory or not toInventory or not fromSlot or not toSlot or not fromAmount or not toAmount or fromAmount < 0 or toAmount < 0 then return end
     local src = source
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
 
-    fromSlot, toSlot, fromAmount, toAmount = tonumber(fromSlot), tonumber(toSlot), tonumber(fromAmount), tonumber(toAmount)
+    fromSlot, toSlot, toAmount = tonumber(fromSlot), tonumber(toSlot), tonumber(toAmount)
+    if not fromSlot or not toSlot or not toAmount or fromSlot % 1 ~= 0 or toSlot % 1 ~= 0 or toAmount % 1 ~= 0 or toAmount <= 0 then return end
+    if fromInventory == toInventory and fromSlot == toSlot then return end
 
     local fromItem = getItem(fromInventory, src, fromSlot)
     local toItem = getItem(toInventory, src, toSlot)
+    local fromItems, fromMaxWeight, fromMaxSlots = getInventoryLimits(fromInventory, src)
+    local toItems, toMaxWeight, toMaxSlots = getInventoryLimits(toInventory, src)
+    if not fromItems or not toItems or not fromMaxWeight or not toMaxWeight or not fromMaxSlots or not toMaxSlots then return end
+    if fromSlot < 1 or fromSlot > fromMaxSlots or toSlot < 1 or toSlot > toMaxSlots then return end
 
     if fromItem then
-        if not toItem and toAmount > fromItem.amount then return end
+        if toAmount > fromItem.amount then return end
         if fromInventory == 'player' and toInventory ~= 'player' then checkWeapon(src, fromItem) end
 
         local fromId = getIdentifier(fromInventory, src)
         local toId = getIdentifier(toInventory, src)
+        local fromSnapshot = copyTable(fromItem)
+        local toSnapshot = copyTable(toItem)
 
-        if toItem and fromItem.name == toItem.name then
-            if RemoveItem(fromId, fromItem.name, toAmount, fromSlot, 'stacked item') then
-                AddItem(toId, toItem.name, toAmount, toSlot, toItem.info, 'stacked item')
+        if fromInventory ~= toInventory then
+            local isSwap = toItem and not CanStackItems(fromItem, toItem)
+            local movedAmount = isSwap and fromItem.amount or toAmount
+            local destinationWeight = GetTotalWeight(toItems) + (fromItem.weight * movedAmount)
+            if isSwap then destinationWeight = destinationWeight - (toItem.weight * toItem.amount) end
+            if destinationWeight > toMaxWeight then return end
+
+            if isSwap then
+                local sourceWeight = GetTotalWeight(fromItems) - (fromItem.weight * fromItem.amount) + (toItem.weight * toItem.amount)
+                if sourceWeight > fromMaxWeight then return end
             end
-        elseif not toItem and toAmount < fromAmount then
+        end
+
+        if toItem and CanStackItems(fromItem, toItem) then
+            if RemoveItem(fromId, fromItem.name, toAmount, fromSlot, 'stacked item') then
+                if not AddItem(toId, toSnapshot.name, toAmount, toSlot, toSnapshot.info, 'stacked item') then
+                    restoreMoveState(fromInventory, toInventory, src, fromItems, toItems, fromSlot, toSlot, fromSnapshot, toSnapshot, 'stack')
+                end
+            end
+        elseif not toItem and toAmount < fromItem.amount then
             if RemoveItem(fromId, fromItem.name, toAmount, fromSlot, 'split item') then
-                AddItem(toId, fromItem.name, toAmount, toSlot, fromItem.info, 'split item')
+                if not AddItem(toId, fromSnapshot.name, toAmount, toSlot, fromSnapshot.info, 'split item') then
+                    restoreMoveState(fromInventory, toInventory, src, fromItems, toItems, fromSlot, toSlot, fromSnapshot, toSnapshot, 'split')
+                end
             end
         else
             if toItem then
-                local fromItemAmount = fromItem.amount
-                local toItemAmount = toItem.amount
-
-                if RemoveItem(fromId, fromItem.name, fromItemAmount, fromSlot, 'swapped item') and RemoveItem(toId, toItem.name, toItemAmount, toSlot, 'swapped item') then
-                    AddItem(toId, fromItem.name, fromItemAmount, toSlot, fromItem.info, 'swapped item')
-                    AddItem(fromId, toItem.name, toItemAmount, fromSlot, toItem.info, 'swapped item')
+                local removedSource = RemoveItem(fromId, fromSnapshot.name, fromSnapshot.amount, fromSlot, 'swapped item')
+                local removedDestination = removedSource and RemoveItem(toId, toSnapshot.name, toSnapshot.amount, toSlot, 'swapped item')
+                local addedSourceToDestination = removedDestination and AddItem(toId, fromSnapshot.name, fromSnapshot.amount, toSlot, fromSnapshot.info, 'swapped item')
+                local addedDestinationToSource = addedSourceToDestination and AddItem(fromId, toSnapshot.name, toSnapshot.amount, fromSlot, toSnapshot.info, 'swapped item')
+                if not (removedSource and removedDestination and addedSourceToDestination and addedDestinationToSource) then
+                    restoreMoveState(fromInventory, toInventory, src, fromItems, toItems, fromSlot, toSlot, fromSnapshot, toSnapshot, 'swap')
                 end
             else
                 if RemoveItem(fromId, fromItem.name, toAmount, fromSlot, 'moved item') then
-                    AddItem(toId, fromItem.name, toAmount, toSlot, fromItem.info, 'moved item')
+                    if not AddItem(toId, fromSnapshot.name, toAmount, toSlot, fromSnapshot.info, 'moved item') then
+                        restoreMoveState(fromInventory, toInventory, src, fromItems, toItems, fromSlot, toSlot, fromSnapshot, toSnapshot, 'move')
+                    end
                 end
             end
         end

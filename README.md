@@ -14,6 +14,27 @@
 ## Documentation
 https://docs.qbcore.org/qbcore-documentation/qbcore-resources/qb-inventory
 
+### Metadata-aware stacking
+
+Stackable items may opt into metadata-based stack identity by setting `info.stack_key` when calling `AddItem`. Two non-unique items with the same name stack when both keys are absent (the legacy behaviour), or when both keys are present and exactly equal. A keyed item never stacks with an unkeyed item or a differently keyed item.
+
+```lua
+exports['qb-inventory']:AddItem(source, 'example_item', 10, false, {
+    stack_key = 'batch-a',
+    quality = 90,
+    origin = 'example'
+}, 'example resource')
+```
+
+Splitting and recombining a compatible stack preserves the complete `info` table. `stack_key` controls only stack compatibility; it does not replace, filter, or make the rest of the metadata unique.
+
+## Changelog
+
+### Unreleased
+
+- Add optional `info.stack_key` stack identity while preserving legacy stacking for items without a key.
+- Enforce stack compatibility on the server for adds, splits, transfers, swaps, and recombination.
+
 ## Installation
 ### Manual
 - Download the script and put it in the `[qb]` directory.

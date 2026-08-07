@@ -258,7 +258,7 @@ const InventoryContainer = Vue.createApp({
                 return;
             }
 
-            if (item.unique) {
+            if (sourceItem.unique) {
                 targetSlot = this.findNextAvailableSlot(targetInventory);
                 if (targetSlot === null) {
                     this.inventoryError(item.slot);
@@ -273,7 +273,7 @@ const InventoryContainer = Vue.createApp({
                 targetInventory[targetSlot] = newItem;
                 newItem.slot = targetSlot;
             } else {
-                const targetItemKey = Object.keys(targetInventory).find((key) => targetInventory[key] && targetInventory[key].name === item.name);
+                const targetItemKey = Object.keys(targetInventory).find((key) => this.canStackItems(targetInventory[key], sourceItem));
                 const targetItem = targetInventory[targetItemKey];
 
                 if (!targetItem) {
@@ -379,7 +379,7 @@ const InventoryContainer = Vue.createApp({
                 const { currentlyDraggingSlot, currentlyDraggingItem, transferAmount } = this;
                 const targetInventory = this.getInventoryByType("player");
                 const targetItem = targetInventory[targetSlot];
-                if ((targetItem && targetItem.name !== currentlyDraggingItem.name) || (targetItem && targetItem.name === currentlyDraggingItem.name && currentlyDraggingItem.unique)) {
+                if (targetItem && !this.canStackItems(targetItem, currentlyDraggingItem)) {
                     this.inventoryError(currentlyDraggingSlot);
                     return;
                 }
@@ -434,6 +434,13 @@ const InventoryContainer = Vue.createApp({
         getInventoryByType(inventoryType) {
             return inventoryType === "player" ? this.playerInventory : this.otherInventory;
         },
+        canStackItems(firstItem, secondItem) {
+            if (!firstItem || !secondItem || firstItem.name !== secondItem.name || firstItem.unique || secondItem.unique) return false;
+            const firstKey = firstItem.info?.stack_key;
+            const secondKey = secondItem.info?.stack_key;
+            if (firstKey == null && secondKey == null) return true;
+            return firstKey != null && secondKey != null && firstKey === secondKey;
+        },
         handleItemDrop(targetInventoryType, targetSlot) {
             try {
                 const isShop = this.otherInventoryName.indexOf("shop-");
@@ -480,7 +487,7 @@ const InventoryContainer = Vue.createApp({
                         this.inventoryError(this.currentlyDraggingSlot);
                         return;
                     }
-                    if (sourceItem.name === targetItem.name && !targetItem.unique) {
+                    if (this.canStackItems(sourceItem, targetItem)) {
                         targetItem.amount += amountToTransfer;
                         sourceItem.amount -= amountToTransfer;
                         if (sourceItem.amount <= 0) {
@@ -512,7 +519,7 @@ const InventoryContainer = Vue.createApp({
         async handlePurchase(targetSlot, sourceSlot, sourceItem, transferAmount) {
             try {
                 const response = await axios.post("https://qb-inventory/AttemptPurchase", {
-                    item: sourceItem,
+                    slot: sourceSlot,
                     amount: transferAmount || sourceItem.amount,
                     shop: this.otherInventoryName,
                 });
@@ -524,9 +531,9 @@ const InventoryContainer = Vue.createApp({
                         this.inventoryError(sourceSlot);
                         return;
                     }
-                    let targetItem = targetInventory[targetSlot];
-                    if (!targetItem || targetItem.name !== sourceItem.name) {
-                        let foundSlot = Object.keys(targetInventory).find((slot) => targetInventory[slot] && targetInventory[slot].name === sourceItem.name);
+                    const targetItem = targetInventory[targetSlot];
+                    if (!this.canStackItems(targetItem, sourceItem)) {
+                        const foundSlot = Object.keys(targetInventory).find((slot) => this.canStackItems(targetInventory[slot], sourceItem));
                         if (foundSlot) {
                             targetInventory[foundSlot].amount += amountToTransfer;
                         } else {
@@ -639,21 +646,17 @@ const InventoryContainer = Vue.createApp({
                 this.contextMenuItem = null;
             } else {
                 if (item.inventory === "other") {
-                    const matchingItemKey = Object.keys(this.playerInventory).find((key) => this.playerInventory[key].name === item.name);
+                    const matchingItemKey = Object.keys(this.playerInventory).find((key) => this.canStackItems(this.playerInventory[key], item));
                     const matchingItem = this.playerInventory[matchingItemKey];
 
-                    if (matchingItem && matchingItem.unique) {
-                        const newItemKey = Object.keys(this.playerInventory).length + 1;
-                        const newItem = {
-                            ...item,
-                            inventory: "player",
-                            amount: 1,
-                        };
-                        this.playerInventory[newItemKey] = newItem;
-                    } else if (matchingItem) {
+                    if (matchingItem) {
                         matchingItem.amount++;
                     } else {
-                        const newItemKey = Object.keys(this.playerInventory).length + 1;
+                        const newItemKey = this.findNextAvailableSlot(this.playerInventory);
+                        if (newItemKey === null) {
+                            this.inventoryError(item.slot);
+                            return;
+                        }
                         const newItem = {
                             ...item,
                             inventory: "player",

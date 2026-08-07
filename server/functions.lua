@@ -237,6 +237,38 @@ end
 
 exports('GetFirstSlotByItem', GetFirstSlotByItem)
 
+--- Returns whether two authoritative item stacks may be merged.
+--- Items without a stack_key retain the legacy name-based stacking behaviour.
+function CanStackItems(firstItem, secondItem)
+    if not firstItem or not secondItem then return false end
+    if firstItem.name:lower() ~= secondItem.name:lower() then return false end
+    if firstItem.unique or secondItem.unique then return false end
+
+    local firstInfo = type(firstItem.info) == 'table' and firstItem.info or {}
+    local secondInfo = type(secondItem.info) == 'table' and secondItem.info or {}
+    local firstKey = firstInfo.stack_key
+    local secondKey = secondInfo.stack_key
+
+    if firstKey == nil and secondKey == nil then return true end
+    return firstKey ~= nil and secondKey ~= nil and firstKey == secondKey
+end
+
+exports('CanStackItems', CanStackItems)
+
+--- Finds a name and metadata-compatible stack without changing legacy slot helpers.
+function GetFirstCompatibleSlotByItem(items, itemName, info)
+    if not items then return nil end
+    local itemInfo = QBCore.Shared.Items[itemName:lower()]
+    if not itemInfo then return nil end
+    local candidate = { name = itemInfo.name, unique = itemInfo.unique, info = info or {} }
+    for slot, inventoryItem in pairs(items) do
+        if CanStackItems(inventoryItem, candidate) then return tonumber(slot) end
+    end
+    return nil
+end
+
+exports('GetFirstCompatibleSlotByItem', GetFirstCompatibleSlotByItem)
+
 --- Retrieves an item from a player's inventory based on the specified slot.
 --- @param source number The player's server ID.
 --- @param slot number The slot number of the item.
@@ -360,11 +392,13 @@ exports('GetItemCount', GetItemCount)
 --- @param amount number The amount of the item.
 --- @return boolean - Returns true if the item can be added, false otherwise.
 --- @return string|nil - Returns a string indicating the reason why the item cannot be added (e.g., 'weight' or 'slots'), or nil if it can be added.
-function CanAddItem(identifier, item, amount)
+function CanAddItem(identifier, item, amount, info)
     local Player = exports['qb-core']:GetPlayer(identifier)
 
     local itemData = QBCore.Shared.Items[item:lower()]
     if not itemData then return false end
+    amount = tonumber(amount)
+    if not amount or amount <= 0 then return false end
 
     local inventory, items
     if Player then
@@ -393,8 +427,7 @@ function CanAddItem(identifier, item, amount)
 
     if slotsUsed >= inventory.slots then
         for _, v in pairs(items) do
-            if v.name == itemData.name then
-                if itemData.unique then break end
+            if CanStackItems(v, { name = itemData.name, unique = itemData.unique, info = info or {} }) then
                 print(('CanAddItem: Player %s has no free slots for item %s, but has %d of it already'):format(identifier, itemData.name, v.amount))
                 goto continue
             end
@@ -715,24 +748,28 @@ function AddItem(identifier, item, amount, slot, info, reason)
         return false
     end
 
+    amount = tonumber(amount) or 1
+    if amount <= 0 then return false end
+    info = type(info) == 'table' and info or {}
+
     local totalWeight = GetTotalWeight(inventory)
     if totalWeight + (itemInfo.weight * amount) > inventoryWeight then
         print('AddItem: Not enough weight available')
         return false
     end
 
-    amount = tonumber(amount) or 1
     local updated = false
 
     if not itemInfo.unique then
-        slot = slot or GetFirstSlotByItem(inventory, item)
+        slot = tonumber(slot) or GetFirstCompatibleSlotByItem(inventory, item, info)
         if slot then
-            for _, invItem in pairs(inventory) do
-                if invItem.slot == slot then
-                    invItem.amount = invItem.amount + amount
-                    updated = true
-                    break
-                end
+            local invItem = inventory[slot]
+            if invItem and CanStackItems(invItem, { name = itemInfo.name, unique = itemInfo.unique, info = info }) then
+                invItem.amount = invItem.amount + amount
+                updated = true
+            elseif invItem then
+                print('AddItem: Slot is occupied by an incompatible item')
+                return false
             end
         end
     end
@@ -743,11 +780,15 @@ function AddItem(identifier, item, amount, slot, info, reason)
             print('AddItem: No free slot available')
             return false
         end
+        if inventory[slot] then
+            print('AddItem: Slot is occupied')
+            return false
+        end
 
         inventory[slot] = {
             name = item,
             amount = amount,
-            info = info or {},
+            info = info,
             label = itemInfo.label,
             description = itemInfo.description or '',
             weight = itemInfo.weight,
