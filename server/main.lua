@@ -640,6 +640,7 @@ QBCore.Functions.CreateCallback('qb-inventory:server:beginDropCarry', function(s
     drop.carryStartedAt = os.time()
     ActiveDropCarries[src] = dropId
     dropCarryUpdateTimes[src] = GetGameTimer()
+    TriggerClientEvent('qb-inventory:client:dropCarryStarted', -1, dropId, drop.entityId, src)
     cb(true)
 end)
 
@@ -675,6 +676,20 @@ end)
 
 QBCore.Functions.CreateCallback('qb-inventory:server:GetCurrentDrops', function(_, cb)
     cb(Drops)
+end)
+
+QBCore.Functions.CreateCallback('qb-inventory:server:GetCurrentDropVisualStates', function(_, cb)
+    local visualStates = {}
+    for dropId, drop in pairs(Drops) do
+        if drop.carriedBy then
+            visualStates[#visualStates + 1] = {
+                dropId = dropId,
+                entityId = drop.entityId,
+                carrierServerId = drop.carriedBy
+            }
+        end
+    end
+    cb(visualStates)
 end)
 
 QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(source, cb, item)

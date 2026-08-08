@@ -13,6 +13,7 @@ end)
 RegisterNetEvent('QBCore:Client:OnPlayerUnload', function()
     LocalPlayer.state:set('inv_busy', true, true)
     PlayerData = nil
+    if CleanupDropVisualState then CleanupDropVisualState() end
 end)
 
 RegisterNetEvent('QBCore:Client:UpdateObject', function()
@@ -28,6 +29,7 @@ end)
 AddEventHandler('onResourceStart', function(resourceName)
     if resourceName == GetCurrentResourceName() then
         PlayerData = QBCore.Functions.GetPlayerData()
+        GetDrops()
     end
 end)
 
