@@ -8,6 +8,8 @@ ActiveDropCarries = {}
 
 local dropCarryUpdateTimes = {}
 local dropSecurityLogTimes = {}
+local dropEntityEnsureTimes = {}
+local dropEntityLogTimes = {}
 
 local function dropSecurityLog(source, dropId, action, reason)
     local now = GetGameTimer()
@@ -33,6 +35,57 @@ local function getEntityForwardFromHeading(entity)
     return vector3(-math.sin(heading), math.cos(heading), 0.0)
 end
 
+local function isSourceInDropBucket(source, drop)
+    return drop and drop.bucket ~= nil and GetPlayerRoutingBucket(source) == drop.bucket
+end
+
+local function TriggerDropBucketEvent(drop, eventName, ...)
+    if not drop or drop.bucket == nil then return end
+    local args = { ... }
+    for _, playerId in pairs(QBCore.Functions.GetPlayers()) do
+        if GetPlayerRoutingBucket(playerId) == drop.bucket then
+            TriggerClientEvent(eventName, playerId, table.unpack(args))
+        end
+    end
+end
+
+local function setDropEntityPersistence(entity, bucket)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return end
+    SetEntityRoutingBucket(entity, bucket)
+    if SetEntityOrphanMode then pcall(SetEntityOrphanMode, entity, 2) end
+end
+
+local function EnsureDropEntity(dropId)
+    local drop = Drops[dropId]
+    if not drop or not drop.coords or drop.bucket == nil then return nil end
+    local entity = drop.entityId and NetworkGetEntityFromNetworkId(drop.entityId) or 0
+    if entity and entity ~= 0 and DoesEntityExist(entity) then
+        setDropEntityPersistence(entity, drop.bucket)
+        return entity
+    end
+
+    local now = GetGameTimer()
+    if dropEntityEnsureTimes[dropId] and now - dropEntityEnsureTimes[dropId] < 1000 then return nil end
+    dropEntityEnsureTimes[dropId] = now
+    if not dropEntityLogTimes[dropId] or now - dropEntityLogTimes[dropId] >= 10000 then
+        dropEntityLogTimes[dropId] = now
+        print(('[qb-inventory security] drop=%s action=entity-recreate reason=authoritative entity missing; logical inventory preserved'):format(tostring(dropId)))
+    end
+    entity = CreateObjectNoOffset(Config.ItemDropObject, drop.coords.x, drop.coords.y, drop.coords.z, true, true, false)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return nil end
+    setDropEntityPersistence(entity, drop.bucket)
+    local entityId = NetworkGetNetworkIdFromEntity(entity)
+    if not entityId or entityId == 0 then
+        DeleteEntity(entity)
+        return nil
+    end
+    drop.entityId = entityId
+    dropEntityEnsureTimes[dropId] = nil
+    FreezeEntityPosition(entity, true)
+    if not drop.carriedBy then TriggerDropBucketEvent(drop, 'qb-inventory:client:setupDropTarget', entityId, dropId) end
+    return entity
+end
+
 local function setDropEntityPosition(drop, coords)
     if not drop or not drop.entityId then return false end
     local entity = NetworkGetEntityFromNetworkId(drop.entityId)
@@ -40,6 +93,17 @@ local function setDropEntityPosition(drop, coords)
     SetEntityCoords(entity, coords.x, coords.y, coords.z, false, false, false, false)
     FreezeEntityPosition(entity, true)
     return true
+end
+
+local function broadcastDropPlacement(dropId, drop, extraSource)
+    local entity = EnsureDropEntity(dropId)
+    if entity then
+        setDropEntityPosition(drop, drop.coords)
+        TriggerDropBucketEvent(drop, 'qb-inventory:client:placeDrop', drop.entityId, drop.coords, dropId)
+    end
+    if extraSource and GetPlayerRoutingBucket(extraSource) ~= drop.bucket then
+        TriggerClientEvent('qb-inventory:client:clearDropCarryVisual', extraSource, dropId)
+    end
 end
 
 local function clearDropCarry(source, dropId, updatePosition)
@@ -72,6 +136,12 @@ local function clearStaleDropCarry(dropId, drop)
     dropCarryUpdateTimes[carrier] = nil
     drop.carriedBy = nil
     drop.carryStartedAt = nil
+end
+
+local function terminateCarryForBucketMismatch(source, dropId, drop, action)
+    dropSecurityLog(source, dropId, action, 'carrier routing bucket no longer matches drop')
+    local released, releasedDrop = clearDropCarry(source, dropId, false)
+    if released and releasedDrop then broadcastDropPlacement(dropId, releasedDrop, source) end
 end
 
 local function inventorySecurityLog(source, fromInventory, toInventory, reason)
@@ -177,6 +247,11 @@ function CanAccessInventory(source, inventoryId)
         local drop = Drops[inventoryId]
         if not drop then return false, 'drop no longer exists' end
         if drop.isOpen ~= source then return false, 'drop lock is not owned by source' end
+        if not isSourceInDropBucket(source, drop) then return false, 'source routing bucket does not match drop' end
+        local entity = drop.entityId and NetworkGetEntityFromNetworkId(drop.entityId) or 0
+        if entity and entity ~= 0 and DoesEntityExist(entity) and GetEntityRoutingBucket(entity) ~= drop.bucket then
+            return false, 'drop entity routing bucket mismatch'
+        end
         if not isDropInRange(source, drop) then return false, 'source is too far from drop' end
         return true
     elseif session.kind == 'otherplayer' then
@@ -229,12 +304,44 @@ CreateThread(function()
     while true do
         for k, v in pairs(Drops) do
             if v and (v.createdTime + (Config.CleanupDropTime * 60) < os.time()) and not v.isOpen and not v.carriedBy then
-                local entity = NetworkGetEntityFromNetworkId(v.entityId)
+                TriggerDropBucketEvent(v, 'qb-inventory:client:removeDropTarget', v.entityId, k)
+                local entity = v.entityId and NetworkGetEntityFromNetworkId(v.entityId) or 0
                 if DoesEntityExist(entity) then DeleteEntity(entity) end
+                for sourceId, session in pairs(ActiveInventorySessions) do
+                    if session.kind == 'drop' and session.inventoryId == k then ClearInventorySession(sourceId) end
+                end
+                for carrier, carriedDropId in pairs(ActiveDropCarries) do
+                    if carriedDropId == k then
+                        ActiveDropCarries[carrier] = nil
+                        dropCarryUpdateTimes[carrier] = nil
+                    end
+                end
                 Drops[k] = nil
+                dropEntityEnsureTimes[k] = nil
+                dropEntityLogTimes[k] = nil
             end
         end
         Wait(Config.CleanupDropInterval * 60000)
+    end
+end)
+
+CreateThread(function()
+    while true do
+        local bucketMismatches = {}
+        for sourceId, dropId in pairs(ActiveDropCarries) do
+            local drop = Drops[dropId]
+            if drop and QBCore.Functions.GetPlayer(sourceId) and not isSourceInDropBucket(sourceId, drop) then
+                bucketMismatches[#bucketMismatches + 1] = { source = sourceId, dropId = dropId }
+            end
+        end
+        for i = 1, #bucketMismatches do
+            local mismatch = bucketMismatches[i]
+            local drop = Drops[mismatch.dropId]
+            if drop and ActiveDropCarries[mismatch.source] == mismatch.dropId then
+                terminateCarryForBucketMismatch(mismatch.source, mismatch.dropId, drop, 'bucket-reconcile')
+            end
+        end
+        Wait(1000)
     end
 end)
 
@@ -244,22 +351,24 @@ AddEventHandler('playerDropped', function()
     local src = tonumber(source) or source
     local carriedDropId = ActiveDropCarries[src]
     if carriedDropId then
-        local _, carriedDrop = clearDropCarry(src, carriedDropId, true)
-        if carriedDrop then
-            TriggerClientEvent('qb-inventory:client:placeDrop', -1, carriedDrop.entityId, carriedDrop.coords, carriedDropId)
+        local carriedDrop = Drops[carriedDropId]
+        local updatePosition = carriedDrop and isSourceInDropBucket(src, carriedDrop)
+        local _, releasedDrop = clearDropCarry(src, carriedDropId, updatePosition)
+        if releasedDrop then
+            broadcastDropPlacement(carriedDropId, releasedDrop)
         end
     end
     for dropId, drop in pairs(Drops) do
         if drop.carriedBy == src then
             local coords, ped = getServerPlayerCoords(src)
-            if coords then
+            if coords and isSourceInDropBucket(src, drop) then
                 local forward = getEntityForwardFromHeading(ped)
                 drop.coords = vector3(coords.x + forward.x * 0.57, coords.y + forward.y * 0.57, coords.z - 0.9)
                 setDropEntityPosition(drop, drop.coords)
             end
             drop.carriedBy = nil
             drop.carryStartedAt = nil
-            TriggerClientEvent('qb-inventory:client:placeDrop', -1, drop.entityId, drop.coords, dropId)
+            broadcastDropPlacement(dropId, drop)
         end
     end
     ActiveDropCarries[src] = nil
@@ -435,11 +544,13 @@ RegisterNetEvent('qb-inventory:server:closeInventory', function(inventory)
     Player(src).state.inv_busy = false
     if drop then
         if #drop.items == 0 and not drop.isOpen then -- if no listed items in the drop on close
-            TriggerClientEvent('qb-inventory:client:removeDropTarget', -1, Drops[inventory].entityId)
+            TriggerDropBucketEvent(drop, 'qb-inventory:client:removeDropTarget', drop.entityId, inventory)
             Wait(500)
-            local entity = NetworkGetEntityFromNetworkId(Drops[inventory].entityId)
+            local entity = NetworkGetEntityFromNetworkId(drop.entityId)
             if DoesEntityExist(entity) then DeleteEntity(entity) end
             Drops[inventory] = nil
+            dropEntityEnsureTimes[inventory] = nil
+            dropEntityLogTimes[inventory] = nil
         end
     end
 end)
@@ -523,12 +634,20 @@ RegisterNetEvent('qb-inventory:server:openDrop', function(dropId)
         dropSecurityLog(src, dropId, 'open', 'unknown drop')
         return
     end
+    if not isSourceInDropBucket(src, drop) then
+        dropSecurityLog(src, dropId, 'open', 'source routing bucket does not match drop')
+        return
+    end
     clearStaleDropCarry(dropId, drop)
     if drop.carriedBy then
         dropSecurityLog(src, dropId, 'open', 'drop is currently carried')
         return
     end
     if drop.isOpen then return end
+    if not EnsureDropEntity(dropId) then
+        dropSecurityLog(src, dropId, 'open', 'authoritative drop entity is unavailable')
+        return
+    end
     local distance = #(playerCoords - drop.coords)
     if distance > 2.5 then return end
     local formattedInventory = {
@@ -556,6 +675,10 @@ RegisterNetEvent('qb-inventory:server:updateDrop', function(dropId, _)
     end
     if ActiveDropCarries[src] ~= dropId or drop.carriedBy ~= src then
         dropSecurityLog(src, dropId, 'update', 'source is not the authorized carrier')
+        return
+    end
+    if not isSourceInDropBucket(src, drop) then
+        terminateCarryForBucketMismatch(src, dropId, drop, 'update')
         return
     end
     local now = GetGameTimer()
@@ -590,6 +713,11 @@ QBCore.Functions.CreateCallback('qb-inventory:server:beginDropCarry', function(s
     local drop = Drops[dropId]
     if not drop then
         dropSecurityLog(src, dropId, 'carry-start', 'unknown drop')
+        cb(false)
+        return
+    end
+    if not isSourceInDropBucket(src, drop) then
+        dropSecurityLog(src, dropId, 'carry-start', 'source routing bucket does not match drop')
         cb(false)
         return
     end
@@ -629,8 +757,8 @@ QBCore.Functions.CreateCallback('qb-inventory:server:beginDropCarry', function(s
         cb(false)
         return
     end
-    local entity = drop.entityId and NetworkGetEntityFromNetworkId(drop.entityId) or 0
-    if not entity or entity == 0 or not DoesEntityExist(entity) then
+    local entity = EnsureDropEntity(dropId)
+    if not entity then
         dropSecurityLog(src, dropId, 'carry-start', 'authoritative drop entity is unavailable')
         cb(false)
         return
@@ -640,7 +768,7 @@ QBCore.Functions.CreateCallback('qb-inventory:server:beginDropCarry', function(s
     drop.carryStartedAt = os.time()
     ActiveDropCarries[src] = dropId
     dropCarryUpdateTimes[src] = GetGameTimer()
-    TriggerClientEvent('qb-inventory:client:dropCarryStarted', -1, dropId, drop.entityId, src)
+    TriggerDropBucketEvent(drop, 'qb-inventory:client:dropCarryStarted', dropId, drop.entityId, src)
     cb(true)
 end)
 
@@ -662,6 +790,11 @@ QBCore.Functions.CreateCallback('qb-inventory:server:releaseDropCarry', function
         cb(false)
         return
     end
+    if not isSourceInDropBucket(src, drop) then
+        terminateCarryForBucketMismatch(src, dropId, drop, 'carry-release')
+        cb(false)
+        return
+    end
     local coords = getServerPlayerCoords(src)
     if not coords then
         dropSecurityLog(src, dropId, 'carry-release', 'carrier ped is unavailable')
@@ -670,26 +803,26 @@ QBCore.Functions.CreateCallback('qb-inventory:server:releaseDropCarry', function
     end
     local released, releasedDrop = clearDropCarry(src, dropId, true)
     if not released or not releasedDrop then cb(false) return end
-    TriggerClientEvent('qb-inventory:client:placeDrop', -1, releasedDrop.entityId, releasedDrop.coords, dropId)
+    broadcastDropPlacement(dropId, releasedDrop)
     cb(true)
 end)
 
-QBCore.Functions.CreateCallback('qb-inventory:server:GetCurrentDrops', function(_, cb)
-    cb(Drops)
-end)
-
-QBCore.Functions.CreateCallback('qb-inventory:server:GetCurrentDropVisualStates', function(_, cb)
+QBCore.Functions.CreateCallback('qb-inventory:server:GetCurrentDrops', function(source, cb)
+    local bucket = GetPlayerRoutingBucket(source)
     local visualStates = {}
     for dropId, drop in pairs(Drops) do
-        if drop.carriedBy then
-            visualStates[#visualStates + 1] = {
-                dropId = dropId,
-                entityId = drop.entityId,
-                carrierServerId = drop.carriedBy
-            }
+        if drop.bucket == bucket then
+            local entity = EnsureDropEntity(dropId)
+            if entity then
+                visualStates[dropId] = {
+                    entityId = drop.entityId,
+                    bucket = drop.bucket,
+                    carriedBy = drop.carriedBy
+                }
+            end
         end
     end
-    cb(visualStates)
+    cb({ bucket = bucket, drops = visualStates })
 end)
 
 QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(source, cb, item)
@@ -720,6 +853,7 @@ QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(sourc
 
     local playerPed = GetPlayerPed(src)
     local playerCoords = GetEntityCoords(playerPed)
+    local playerBucket = GetPlayerRoutingBucket(src)
     if not RemoveItem(src, sourceSnapshot.name, amount, fromSlot, 'dropped item') then
         cb(false)
         return
@@ -732,6 +866,7 @@ QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(sourc
     local created, dropId = pcall(function()
         bag = CreateObjectNoOffset(Config.ItemDropObject, playerCoords.x + 0.5, playerCoords.y + 0.5, playerCoords.z, true, true, false)
         if not bag or bag == 0 or not DoesEntityExist(bag) then return nil end
+        setDropEntityPersistence(bag, playerBucket)
         local networkId = NetworkGetNetworkIdFromEntity(bag)
         if not networkId or networkId == 0 then return nil end
         local newDropId = 'drop-' .. networkId
@@ -756,7 +891,8 @@ QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(sourc
                 slots = Config.DropSize.slots,
                 isOpen = src,
                 carriedBy = nil,
-                carryStartedAt = nil
+                carryStartedAt = nil,
+                bucket = playerBucket
             }
         else
             dropItem.slot = #Drops[newDropId].items + 1
@@ -788,7 +924,7 @@ QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(sourc
     BeginInventorySession(src, 'drop', dropKey)
     Drops[dropKey].isOpen = src
     TaskPlayAnim(playerPed, 'pickup_object', 'pickup_low', 8.0, -8.0, 2000, 0, 0, false, false, false)
-    TriggerClientEvent('qb-inventory:client:setupDropTarget', -1, dropId)
+    TriggerDropBucketEvent(Drops[dropKey], 'qb-inventory:client:setupDropTarget', dropId, dropKey)
     cb(dropId)
 end)
 

@@ -9,6 +9,9 @@ local DropTargets = {}
 local DropEntityIds = {}
 local PendingDropPlacements = {}
 local HiddenDropEntities = {}
+local CurrentDropBucket = nil
+local dropVisualSyncPending = false
+local lastDropVisualSync = 0
 CurrentDrop = nil
 
 -- Functions
@@ -219,30 +222,6 @@ local function registerDropTarget(dropId, entityId)
     DropTargets[dropId] = { entityId = entityId, entity = entity, active = true }
 end
 
-local function syncCarryVisuals(done)
-    QBCore.Functions.TriggerCallback('qb-inventory:server:GetCurrentDropVisualStates', function(states)
-        local activeVisuals = {}
-        if type(states) == 'table' then
-            for _, state in pairs(states) do
-                activeVisuals[state.dropId] = true
-                startCarryVisual(state.dropId, state.entityId, state.carrierServerId)
-            end
-        end
-        local staleVisuals = {}
-        for dropId in pairs(CarryVisuals) do
-            if not activeVisuals[dropId] then staleVisuals[#staleVisuals + 1] = dropId end
-        end
-        for i = 1, #staleVisuals do
-            local dropId = staleVisuals[i]
-            local entityId = DropEntityIds[dropId]
-            deleteCarryProxy(dropId)
-            clearLocalCarrierState(dropId)
-            registerDropTarget(dropId, entityId)
-        end
-        if done then done() end
-    end)
-end
-
 function CleanupDropVisualState()
     for _, visual in pairs(CarryVisuals) do
         clearCarryProxyObject(visual)
@@ -273,25 +252,63 @@ function CleanupDropVisualState()
     carryRequestPending = false
     releaseRequestPending = false
     lastCarryHeartbeat = 0
+    CurrentDropBucket = nil
+    dropVisualSyncPending = false
+    lastDropVisualSync = 0
     CurrentDrop = nil
     exports['qb-core']:HideText()
 end
 
 function GetDrops()
-    syncCarryVisuals(function()
-        QBCore.Functions.TriggerCallback('qb-inventory:server:GetCurrentDrops', function(drops)
-            if not drops then return end
-            for k, v in pairs(drops) do
-                registerDropTarget(k, v.entityId)
+    if dropVisualSyncPending then return end
+    dropVisualSyncPending = true
+    QBCore.Functions.TriggerCallback('qb-inventory:server:GetCurrentDrops', function(response)
+        dropVisualSyncPending = false
+        lastDropVisualSync = GetGameTimer()
+        if type(response) ~= 'table' or type(response.drops) ~= 'table' or type(response.bucket) ~= 'number' then return end
+
+        if CurrentDropBucket ~= nil and CurrentDropBucket ~= response.bucket then
+            CleanupDropVisualState()
+        end
+        CurrentDropBucket = response.bucket
+        lastDropVisualSync = GetGameTimer()
+
+        local synchronizedDrops = {}
+        for dropId, state in pairs(response.drops) do
+            if type(dropId) == 'string' and type(state) == 'table' and state.bucket == response.bucket and state.entityId then
+                synchronizedDrops[dropId] = true
+                DropEntityIds[dropId] = state.entityId
+                if state.carriedBy then
+                    startCarryVisual(dropId, state.entityId, state.carriedBy)
+                else
+                    deleteCarryProxy(dropId)
+                    clearLocalCarrierState(dropId)
+                    registerDropTarget(dropId, state.entityId)
+                end
             end
-        end)
+        end
+
+        local staleDrops = {}
+        for dropId in pairs(DropEntityIds) do
+            if not synchronizedDrops[dropId] then staleDrops[#staleDrops + 1] = dropId end
+        end
+        for i = 1, #staleDrops do
+            local dropId = staleDrops[i]
+            removeDropTarget(dropId)
+            deleteCarryProxy(dropId)
+            clearLocalCarrierState(dropId)
+            DropTargets[dropId] = nil
+            DropEntityIds[dropId] = nil
+            PendingDropPlacements[dropId] = nil
+            HiddenDropEntities[dropId] = nil
+        end
     end)
 end
 
 -- Events
 
-RegisterNetEvent('qb-inventory:client:removeDropTarget', function(dropId)
-    local inventoryId = 'drop-' .. dropId
+RegisterNetEvent('qb-inventory:client:removeDropTarget', function(dropId, inventoryId)
+    inventoryId = inventoryId or ('drop-' .. dropId)
     removeDropTarget(inventoryId)
     deleteCarryProxy(inventoryId)
     DropTargets[inventoryId] = nil
@@ -302,6 +319,16 @@ end)
 
 RegisterNetEvent('qb-inventory:client:dropCarryStarted', function(dropId, entityId, carrierServerId)
     startCarryVisual(dropId, entityId, carrierServerId)
+end)
+
+RegisterNetEvent('qb-inventory:client:clearDropCarryVisual', function(dropId)
+    deleteCarryProxy(dropId)
+    clearLocalCarrierState(dropId)
+    removeDropTarget(dropId)
+    DropTargets[dropId] = nil
+    DropEntityIds[dropId] = nil
+    PendingDropPlacements[dropId] = nil
+    HiddenDropEntities[dropId] = nil
 end)
 
 RegisterNetEvent('qb-inventory:client:placeDrop', function(entityId, coords, dropId)
@@ -321,8 +348,8 @@ RegisterNetEvent('qb-inventory:client:placeDrop', function(entityId, coords, dro
     clearLocalCarrierState(dropId)
 end)
 
-RegisterNetEvent('qb-inventory:client:setupDropTarget', function(dropId)
-    local newDropId = 'drop-' .. dropId
+RegisterNetEvent('qb-inventory:client:setupDropTarget', function(dropId, inventoryId)
+    local newDropId = inventoryId or ('drop-' .. dropId)
     registerDropTarget(newDropId, dropId)
 end)
 
@@ -368,6 +395,7 @@ CreateThread(function()
                 registerDropTarget(dropId, target.entityId or DropEntityIds[dropId])
             end
         end
+        if GetGameTimer() - lastDropVisualSync >= 3000 then GetDrops() end
         Wait(500)
     end
 end)
