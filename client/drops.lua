@@ -8,6 +8,18 @@ CurrentDrop = nil
 
 -- Functions
 
+local function requestDropRelease()
+    if not HoldingDrop or not heldDrop or releaseRequestPending then return end
+
+    releaseRequestPending = true
+    QBCore.Functions.TriggerCallback('qb-inventory:server:releaseDropCarry', function(released)
+        if not released then
+            releaseRequestPending = false
+            QBCore.Functions.Notify('Unable to place this bag.', 'error', 3500)
+        end
+    end, heldDrop)
+end
+
 function GetDrops()
     QBCore.Functions.TriggerCallback('qb-inventory:server:GetCurrentDrops', function(drops)
         if not drops then return end
@@ -91,8 +103,11 @@ RegisterNetEvent('qb-inventory:client:setupDropTarget', function(dropId)
                             QBCore.Functions.Notify('Unable to carry this bag.', 'error', 3500)
                             return
                         end
+                        HoldingDrop = true
+                        heldDrop = newDropId
+                        releaseRequestPending = false
                         if not DoesEntityExist(bag) then
-                            QBCore.Functions.TriggerCallback('qb-inventory:server:releaseDropCarry', function() end, newDropId)
+                            requestDropRelease()
                             return
                         end
                         AttachEntityToEntity(
@@ -108,10 +123,8 @@ RegisterNetEvent('qb-inventory:client:setupDropTarget', function(dropId)
                             true, true, false, true, 1, true
                         )
                         bagObject = bag
-                        HoldingDrop = true
-                        heldDrop = newDropId
                         lastCarryHeartbeat = GetGameTimer()
-                        exports['qb-core']:DrawText(Lang:t('interaction.drop_bag'))
+                        exports['qb-core']:DrawText('Press your Drop Bag key to place the bag')
                     end, newDropId)
                 end,
             }
@@ -138,6 +151,15 @@ RegisterNUICallback('DropItem', function(item, cb)
     end, item)
 end)
 
+RegisterCommand('+qbInventoryDropBag', function()
+    requestDropRelease()
+end, false)
+
+RegisterCommand('-qbInventoryDropBag', function()
+end, false)
+
+RegisterKeyMapping('+qbInventoryDropBag', 'Release carried inventory bag', 'keyboard', 'G')
+
 -- Thread
 
 CreateThread(function()
@@ -148,14 +170,8 @@ CreateThread(function()
                 lastCarryHeartbeat = now
                 TriggerServerEvent('qb-inventory:server:updateDrop', heldDrop)
             end
-            if IsControlJustPressed(0, 47) and not releaseRequestPending then
-                releaseRequestPending = true
-                QBCore.Functions.TriggerCallback('qb-inventory:server:releaseDropCarry', function(released)
-                    if not released then
-                        releaseRequestPending = false
-                        QBCore.Functions.Notify('Unable to place this bag.', 'error', 3500)
-                    end
-                end, heldDrop)
+            if IsControlJustPressed(0, 47) or IsDisabledControlJustPressed(0, 47) then
+                requestDropRelease()
             end
         end
         Wait(0)

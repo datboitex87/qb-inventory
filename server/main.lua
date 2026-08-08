@@ -25,6 +25,14 @@ local function getServerPlayerCoords(source)
     return GetEntityCoords(ped), ped
 end
 
+local function getEntityForwardFromHeading(entity)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then
+        return vector3(0.0, 1.0, 0.0)
+    end
+    local heading = math.rad(GetEntityHeading(entity))
+    return vector3(-math.sin(heading), math.cos(heading), 0.0)
+end
+
 local function setDropEntityPosition(drop, coords)
     if not drop or not drop.entityId then return false end
     local entity = NetworkGetEntityFromNetworkId(drop.entityId)
@@ -43,7 +51,7 @@ local function clearDropCarry(source, dropId, updatePosition)
         if updatePosition then
             local coords, ped = getServerPlayerCoords(source)
             if coords then
-                local forward = GetEntityForwardVector(ped)
+                local forward = getEntityForwardFromHeading(ped)
                 drop.coords = vector3(coords.x + forward.x * 0.57, coords.y + forward.y * 0.57, coords.z - 0.9)
                 setDropEntityPosition(drop, drop.coords)
             end
@@ -245,7 +253,7 @@ AddEventHandler('playerDropped', function()
         if drop.carriedBy == src then
             local coords, ped = getServerPlayerCoords(src)
             if coords then
-                local forward = GetEntityForwardVector(ped)
+                local forward = getEntityForwardFromHeading(ped)
                 drop.coords = vector3(coords.x + forward.x * 0.57, coords.y + forward.y * 0.57, coords.z - 0.9)
                 setDropEntityPosition(drop, drop.coords)
             end
