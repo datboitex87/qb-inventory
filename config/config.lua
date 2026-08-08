@@ -21,6 +21,7 @@ Config = {
 
     CleanupDropTime = 15,    -- in minutes
     CleanupDropInterval = 1, -- in minutes
+    DropAccessDistance = 3.0,
 
     ItemDropObject = `bkr_prop_duffel_bag_01a`,
     ItemDropObjectBone = 28422,

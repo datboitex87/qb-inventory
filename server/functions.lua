@@ -533,11 +533,12 @@ exports('HasItem', HasItem)
 -- It also sets the inv_busy flag of the player identified by the given source to false.
 -- Finally, it triggers the 'qb-inventory:client:closeInv' event for the given source.
 function CloseInventory(source, identifier)
-    if identifier and Inventories[identifier] then
-        Inventories[identifier].isOpen = false
-    end
+    local session = GetInventorySession(source)
+    if identifier and (not session or session.inventoryId ~= identifier) then return false end
+    ClearInventorySession(source, identifier)
     Player(source).state.inv_busy = false
     TriggerClientEvent('qb-inventory:client:closeInv', source)
+    return true
 end
 
 exports('CloseInventory', CloseInventory)
@@ -546,22 +547,38 @@ exports('CloseInventory', CloseInventory)
 --- @param source number - The player's server ID.
 --- @param targetId number - The ID of the player whose inventory will be opened.
 function OpenInventoryById(source, targetId)
+    source = tonumber(source) or source
+    targetId = tonumber(targetId)
     local QBPlayer = exports['qb-core']:GetPlayer(source)
-    local TargetPlayer = exports['qb-core']:GetPlayer(tonumber(targetId))
+    local TargetPlayer = exports['qb-core']:GetPlayer(targetId)
     if not QBPlayer or not TargetPlayer then return end
+    if source == targetId then return end
+    if not CanClaimOtherPlayerInventory(source, targetId) then
+        TriggerClientEvent('QBCore:Notify', source, Lang:t('notify.invinuse'), 'error')
+        return
+    end
     if Player(targetId).state.inv_busy then CloseInventory(targetId) end
     local playerItems = QBPlayer.PlayerData.items
-    local targetItems = TargetPlayer.PlayerData.items
+    Wait(1500)
+
+    QBPlayer = exports['qb-core']:GetPlayer(source)
+    TargetPlayer = exports['qb-core']:GetPlayer(targetId)
+    if not QBPlayer or not TargetPlayer then return end
+    if not CanClaimOtherPlayerInventory(source, targetId) or Player(targetId).state.inv_busy then
+        TriggerClientEvent('QBCore:Notify', source, Lang:t('notify.invinuse'), 'error')
+        return
+    end
+
     local formattedInventory = {
         name = 'otherplayer-' .. targetId,
         label = GetPlayerName(targetId),
         maxweight = Config.MaxWeight,
         slots = Config.MaxSlots,
-        inventory = targetItems
+        inventory = TargetPlayer.PlayerData.items
     }
-    Wait(1500)
+    if not BeginInventorySession(source, 'otherplayer', formattedInventory.name, { targetId = targetId }) then return end
     Player(targetId).state.inv_busy = true
-    TriggerClientEvent('qb-inventory:client:openInventory', source, playerItems, formattedInventory)
+    TriggerClientEvent('qb-inventory:client:openInventory', source, QBPlayer.PlayerData.items or playerItems, formattedInventory)
 end
 
 exports('OpenInventoryById', OpenInventoryById)
@@ -633,6 +650,7 @@ function OpenShop(source, name)
         slots = #RegisteredShops[name].items,
         inventory = RegisteredShops[name].items
     }
+    BeginInventorySession(source, 'shop', formattedInventory.name, { shopName = name })
     TriggerClientEvent('qb-inventory:client:openInventory', source, Player.PlayerData.items, formattedInventory)
 end
 
@@ -648,6 +666,7 @@ function OpenInventory(source, identifier, data)
 
     if not identifier then
         Player(source).state.inv_busy = true
+        BeginInventorySession(source, 'player', 'player')
         TriggerClientEvent('qb-inventory:client:openInventory', source, QBPlayer.PlayerData.items)
         return
     end
@@ -668,6 +687,7 @@ function OpenInventory(source, identifier, data)
     inventory.maxweight = (data and data.maxweight) or (inventory and inventory.maxweight) or Config.StashSize.maxweight
     inventory.slots = (data and data.slots) or (inventory and inventory.slots) or Config.StashSize.slots
     inventory.label = (data and data.label) or (inventory and inventory.label) or identifier
+    BeginInventorySession(source, 'inventory', identifier)
     inventory.isOpen = source
 
     local formattedInventory = {

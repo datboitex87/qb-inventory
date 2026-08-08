@@ -2,6 +2,134 @@ QBCore = exports['qb-core']:GetCoreObject()
 Inventories = {}
 Drops = {}
 RegisteredShops = {}
+ActiveInventorySessions = {}
+OtherPlayerInventoryViewers = {}
+
+local function inventorySecurityLog(source, fromInventory, toInventory, reason)
+    local session = ActiveInventorySessions[tonumber(source) or source]
+    print(('[qb-inventory security] source=%s from=%s to=%s authorized=%s reason=%s'):format(
+        tostring(source), tostring(fromInventory), tostring(toInventory),
+        session and tostring(session.inventoryId) or 'none', reason
+    ))
+end
+
+local function isDropInRange(source, drop)
+    if not drop or not drop.coords then return false end
+    local ped = GetPlayerPed(source)
+    if not ped or ped == 0 then return false end
+    return #(GetEntityCoords(ped) - drop.coords) <= (Config.DropAccessDistance or 3.0)
+end
+
+function GetInventorySession(source)
+    return ActiveInventorySessions[tonumber(source) or source]
+end
+
+function ClearInventorySession(source, expectedInventoryId)
+    source = tonumber(source) or source
+    local session = ActiveInventorySessions[source]
+    if not session or (expectedInventoryId and session.inventoryId ~= expectedInventoryId) then return false end
+
+    if session.kind == 'inventory' then
+        local inventory = Inventories[session.inventoryId]
+        if inventory and inventory.isOpen == source then
+            inventory.isOpen = false
+            MySQL.prepare('INSERT INTO inventories (identifier, items) VALUES (?, ?) ON DUPLICATE KEY UPDATE items = ?', { session.inventoryId, json.encode(inventory.items), json.encode(inventory.items) })
+        end
+    elseif session.kind == 'drop' then
+        local drop = Drops[session.inventoryId]
+        if drop and drop.isOpen == source then drop.isOpen = false end
+    elseif session.kind == 'otherplayer' then
+        if OtherPlayerInventoryViewers[session.targetId] == source then
+            OtherPlayerInventoryViewers[session.targetId] = nil
+            local target = QBCore.Functions.GetPlayer(session.targetId)
+            if target then Player(session.targetId).state.inv_busy = false end
+        end
+    end
+
+    ActiveInventorySessions[source] = nil
+    return true, session
+end
+
+function BeginInventorySession(source, kind, inventoryId, context)
+    source = tonumber(source) or source
+    local targetId = context and tonumber(context.targetId) or nil
+    if kind == 'otherplayer' then
+        local viewer = targetId and OtherPlayerInventoryViewers[targetId] or nil
+        if not targetId or (viewer and viewer ~= source) then return false end
+    end
+    ClearInventorySession(source)
+    ActiveInventorySessions[source] = {
+        kind = kind,
+        inventoryId = inventoryId,
+        targetId = targetId,
+        shopName = context and context.shopName or nil,
+        openedAt = os.time()
+    }
+    if kind == 'otherplayer' then OtherPlayerInventoryViewers[targetId] = source end
+    return ActiveInventorySessions[source]
+end
+
+function CanClaimOtherPlayerInventory(source, targetId)
+    source = tonumber(source) or source
+    targetId = tonumber(targetId)
+    if not targetId then return false end
+    local viewer = OtherPlayerInventoryViewers[targetId]
+    if not viewer then return true end
+
+    local viewerSession = GetInventorySession(viewer)
+    local viewerIsActive = QBCore.Functions.GetPlayer(viewer)
+        and viewerSession
+        and viewerSession.kind == 'otherplayer'
+        and viewerSession.targetId == targetId
+        and viewerSession.inventoryId == 'otherplayer-' .. targetId
+    if viewerIsActive then return false end
+
+    if viewerSession and viewerSession.kind == 'otherplayer' and viewerSession.targetId == targetId then
+        ClearInventorySession(viewer)
+    elseif OtherPlayerInventoryViewers[targetId] == viewer then
+        OtherPlayerInventoryViewers[targetId] = nil
+        local target = QBCore.Functions.GetPlayer(targetId)
+        if target then Player(targetId).state.inv_busy = false end
+    end
+    return true
+end
+
+function CanAccessInventory(source, inventoryId)
+    if inventoryId == 'player' then return true end
+    local session = GetInventorySession(source)
+    if not session or session.inventoryId ~= inventoryId then return false, 'inventory does not match active session' end
+
+    if session.kind == 'inventory' then
+        local inventory = Inventories[inventoryId]
+        if not inventory then return false, 'inventory no longer exists' end
+        if inventory.isOpen ~= source then return false, 'inventory lock is not owned by source' end
+        return true
+    elseif session.kind == 'drop' then
+        local drop = Drops[inventoryId]
+        if not drop then return false, 'drop no longer exists' end
+        if drop.isOpen ~= source then return false, 'drop lock is not owned by source' end
+        if not isDropInRange(source, drop) then return false, 'source is too far from drop' end
+        return true
+    elseif session.kind == 'otherplayer' then
+        local targetId = tonumber(inventoryId:match('^otherplayer%-(%d+)$'))
+        if not targetId or targetId ~= session.targetId then return false, 'other-player target mismatch' end
+        if not QBCore.Functions.GetPlayer(targetId) then return false, 'other-player target is unavailable' end
+        if OtherPlayerInventoryViewers[targetId] ~= (tonumber(source) or source) then return false, 'other-player viewer ownership mismatch' end
+        return true
+    end
+
+    return false, 'active session kind cannot move items'
+end
+
+function CanMoveBetweenInventories(source, fromInventory, toInventory)
+    if fromInventory:find('^shop%-') or toInventory:find('^shop%-') then return false, 'shop movement event rejected' end
+    if fromInventory ~= 'player' and toInventory ~= 'player' and fromInventory ~= toInventory then
+        return false, 'cross-external movement rejected'
+    end
+    local allowed, reason = CanAccessInventory(source, fromInventory)
+    if not allowed then return false, reason end
+    return CanAccessInventory(source, toInventory)
+end
 
 local function copyTable(value)
     if type(value) ~= 'table' then return value end
@@ -44,9 +172,42 @@ end)
 -- Handlers
 
 AddEventHandler('playerDropped', function()
-    for _, inv in pairs(Inventories) do
-        if inv.isOpen == source then
-            inv.isOpen = false
+    local src = tonumber(source) or source
+    ClearInventorySession(src)
+    for targetId, viewer in pairs(OtherPlayerInventoryViewers) do
+        if viewer == src then
+            OtherPlayerInventoryViewers[targetId] = nil
+            local target = QBCore.Functions.GetPlayer(targetId)
+            if target then Player(targetId).state.inv_busy = false end
+        end
+    end
+    for _, inventory in pairs(Inventories) do
+        if inventory.isOpen == src then inventory.isOpen = false end
+    end
+    for _, drop in pairs(Drops) do
+        if drop.isOpen == src then drop.isOpen = false end
+    end
+    local affectedViewers = {}
+    local mappedViewer = OtherPlayerInventoryViewers[src]
+    if mappedViewer then affectedViewers[#affectedViewers + 1] = mappedViewer end
+    for viewer, session in pairs(ActiveInventorySessions) do
+        if session.kind == 'otherplayer' and session.targetId == src and viewer ~= mappedViewer then
+            affectedViewers[#affectedViewers + 1] = viewer
+        end
+    end
+    for i = 1, #affectedViewers do
+        local viewer = affectedViewers[i]
+        local viewerSession = GetInventorySession(viewer)
+        local shouldCloseViewer = false
+        if viewerSession and viewerSession.kind == 'otherplayer' and viewerSession.targetId == src then
+            ClearInventorySession(viewer)
+            shouldCloseViewer = true
+        elseif OtherPlayerInventoryViewers[src] == viewer then
+            OtherPlayerInventoryViewers[src] = nil
+        end
+        if shouldCloseViewer and QBCore.Functions.GetPlayer(viewer) then
+            Player(viewer).state.inv_busy = false
+            TriggerClientEvent('qb-inventory:client:closeInv', viewer)
         end
     end
 end)
@@ -170,27 +331,26 @@ RegisterNetEvent('qb-inventory:server:closeInventory', function(inventory)
     local src = source
     local QBPlayer = QBCore.Functions.GetPlayer(src)
     if not QBPlayer then return end
-    Player(source).state.inv_busy = false
-    if inventory:find('shop%-') then return end
-    if inventory:find('otherplayer%-') then
-        local targetId = tonumber(inventory:match('otherplayer%-(.+)'))
-        Player(targetId).state.inv_busy = false
+    if type(inventory) ~= 'string' then return end
+    local session = GetInventorySession(src)
+    if inventory == '' and session and session.kind == 'player' then inventory = 'player' end
+    if not session or session.inventoryId ~= inventory then
+        inventorySecurityLog(src, inventory, inventory, 'close does not match active session')
         return
     end
-    if Drops[inventory] then
-        Drops[inventory].isOpen = false
-        if #Drops[inventory].items == 0 and not Drops[inventory].isOpen then -- if no listeed items in the drop on close
+
+    local drop = session.kind == 'drop' and Drops[inventory] or nil
+    ClearInventorySession(src, inventory)
+    Player(src).state.inv_busy = false
+    if drop then
+        if #drop.items == 0 and not drop.isOpen then -- if no listed items in the drop on close
             TriggerClientEvent('qb-inventory:client:removeDropTarget', -1, Drops[inventory].entityId)
             Wait(500)
             local entity = NetworkGetEntityFromNetworkId(Drops[inventory].entityId)
             if DoesEntityExist(entity) then DeleteEntity(entity) end
             Drops[inventory] = nil
         end
-        return
     end
-    if not Inventories[inventory] then return end
-    Inventories[inventory].isOpen = false
-    MySQL.prepare('INSERT INTO inventories (identifier, items) VALUES (?, ?) ON DUPLICATE KEY UPDATE items = ?', { inventory, json.encode(Inventories[inventory].items), json.encode(Inventories[inventory].items) })
 end)
 
 RegisterNetEvent('qb-inventory:server:useItem', function(item)
@@ -275,7 +435,8 @@ RegisterNetEvent('qb-inventory:server:openDrop', function(dropId)
         slots = drop.slots,
         inventory = drop.items
     }
-    drop.isOpen = true
+    BeginInventorySession(src, 'drop', dropId)
+    drop.isOpen = src
     TriggerClientEvent('qb-inventory:client:openInventory', source, Player.PlayerData.items, formattedInventory)
 end)
 
@@ -359,7 +520,7 @@ QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(sourc
                 coords = playerCoords,
                 maxweight = Config.DropSize.maxweight,
                 slots = Config.DropSize.slots,
-                isOpen = true
+                isOpen = src
             }
         else
             dropItem.slot = #Drops[newDropId].items + 1
@@ -388,6 +549,8 @@ QBCore.Functions.CreateCallback('qb-inventory:server:createDrop', function(sourc
     end
 
     if sourceSnapshot.type == 'weapon' then checkWeapon(src, sourceSnapshot) end
+    BeginInventorySession(src, 'drop', dropKey)
+    Drops[dropKey].isOpen = src
     TaskPlayAnim(playerPed, 'pickup_object', 'pickup_low', 8.0, -8.0, 2000, 0, 0, false, false, false)
     TriggerClientEvent('qb-inventory:client:setupDropTarget', -1, dropId)
     cb(dropId)
@@ -408,6 +571,13 @@ QBCore.Functions.CreateCallback('qb-inventory:server:attemptPurchase', function(
 
     local shopInfo = RegisteredShops[shop]
     if not shopInfo then
+        cb(false)
+        return
+    end
+
+    local session = GetInventorySession(source)
+    if not session or session.kind ~= 'shop' or session.inventoryId ~= data.shop or session.shopName ~= shop then
+        inventorySecurityLog(source, 'player', data.shop, 'purchase does not match active shop session')
         cb(false)
         return
     end
@@ -545,8 +715,8 @@ local function getItem(inventoryId, src, slot)
         if Player and Player.PlayerData.items then
             items = Player.PlayerData.items
         end
-    elseif inventoryId:find('otherplayer-') then
-        local targetId = tonumber(inventoryId:match('otherplayer%-(.+)'))
+    elseif inventoryId:find('^otherplayer%-') then
+        local targetId = tonumber(inventoryId:match('^otherplayer%-(%d+)$'))
         local targetPlayer = QBCore.Functions.GetPlayer(targetId)
         if targetPlayer and targetPlayer.PlayerData.items then
             items = targetPlayer.PlayerData.items
@@ -572,8 +742,8 @@ end
 local function getIdentifier(inventoryId, src)
     if inventoryId == 'player' then
         return src
-    elseif inventoryId:find('otherplayer-') then
-        return tonumber(inventoryId:match('otherplayer%-(.+)'))
+    elseif inventoryId:find('^otherplayer%-') then
+        return tonumber(inventoryId:match('^otherplayer%-(%d+)$'))
     else
         return inventoryId
     end
@@ -584,7 +754,7 @@ local function getInventoryLimits(inventoryId, src)
         local player = QBCore.Functions.GetPlayer(src)
         return player and player.PlayerData.items, Config.MaxWeight, Config.MaxSlots
     elseif inventoryId:find('otherplayer-') == 1 then
-        local targetId = tonumber(inventoryId:match('otherplayer%-(.+)'))
+        local targetId = tonumber(inventoryId:match('^otherplayer%-(%d+)$'))
         local player = targetId and QBCore.Functions.GetPlayer(targetId)
         return player and player.PlayerData.items, Config.MaxWeight, Config.MaxSlots
     elseif inventoryId:find('drop-') == 1 then
@@ -600,7 +770,7 @@ local function syncPlayerInventory(inventoryId, src, items)
     if inventoryId == 'player' then
         playerId = src
     elseif inventoryId:find('otherplayer-') == 1 then
-        playerId = tonumber(inventoryId:match('otherplayer%-(.+)'))
+        playerId = tonumber(inventoryId:match('^otherplayer%-(%d+)$'))
     end
     if not playerId then return true end
     local player = QBCore.Functions.GetPlayer(playerId)
@@ -621,11 +791,19 @@ local function restoreMoveState(fromInventory, toInventory, src, fromItems, toIt
 end
 
 RegisterNetEvent('qb-inventory:server:SetInventoryData', function(fromInventory, toInventory, fromSlot, toSlot, fromAmount, toAmount)
-    if type(fromInventory) ~= 'string' or type(toInventory) ~= 'string' then return end
-    if toInventory:find('shop%-') then return end
     local src = source
+    if type(fromInventory) ~= 'string' or type(toInventory) ~= 'string' then
+        inventorySecurityLog(src, fromInventory, toInventory, 'inventory identifiers must be strings')
+        return
+    end
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
+
+    local authorized, authorizationReason = CanMoveBetweenInventories(src, fromInventory, toInventory)
+    if not authorized then
+        inventorySecurityLog(src, fromInventory, toInventory, authorizationReason)
+        return
+    end
 
     fromSlot, toSlot, toAmount = tonumber(fromSlot), tonumber(toSlot), tonumber(toAmount)
     if not fromSlot or not toSlot or not toAmount or fromSlot % 1 ~= 0 or toSlot % 1 ~= 0 or toAmount % 1 ~= 0 or toAmount <= 0 then return end
